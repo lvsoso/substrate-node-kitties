@@ -11,6 +11,7 @@ use sp_runtime::DispatchError;
 use frame_support::traits::Randomness;
 use frame_support::traits::Currency;
 use frame_support::traits::ReservableCurrency;
+use frame_support::traits::ExistenceRequirement;
 
 use codec::{Encode, Decode};
 use sp_io::hashing::blake2_128;
@@ -29,6 +30,7 @@ mod tests;
 pub struct Kitty(pub [u8; 16]);
 
 type BalanceOf<T> = <<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
+
 pub trait Trait: frame_system::Trait {
 	type Event: From<Event<Self>> + Into<<Self as frame_system::Trait>::Event>;
 	type Randomness: Randomness<Self::Hash>;
@@ -51,6 +53,10 @@ decl_storage! {
 		pub KittiesCount get(fn kitties_count): <T as Trait>::KittyIndex;
 		pub KittyOwners get(fn kitties_owner):  map hasher(blake2_128_concat)  <T as Trait>::KittyIndex => Option<T::AccountId>;
 
+		
+		pub KittyPrices get(fn kitty_price): map hasher(blake2_128_concat) T::KittyIndex =>
+		Option<BalanceOf<T>>;
+		
 		//map: AccountId-> [KittyIndex1, KittyIndex2 ...]
 		pub KittyTotal get(fn kitty_total) : map hasher(blake2_128_concat) T::AccountId => vec::Vec<T::KittyIndex>;
 
@@ -71,10 +77,15 @@ decl_storage! {
 // Pallets use events to inform users when important changes are made.
 // https://substrate.dev/docs/en/knowledgebase/runtime/events
 decl_event!(
-	pub enum Event<T> where  AccountId = <T as frame_system::Trait>::AccountId, <T as Trait>::KittyIndex {
+	pub enum Event<T> where  AccountId = <T as frame_system::Trait>::AccountId, <T as Trait>::KittyIndex, Balance = BalanceOf<T>{
 		Created(AccountId, KittyIndex),
 		Transferred(AccountId, AccountId, KittyIndex),
 		Breed(AccountId, KittyIndex, KittyIndex, KittyIndex),
+
+		/// A kitty is available for sale. (owner, kitty_id, price)
+		Ask(AccountId, KittyIndex, Option<Balance>),
+		/// A kitty is sold. (from, to, kitty_id, price)
+		Sold(AccountId, AccountId, KittyIndex, Balance),
 	}
 );
 
@@ -88,6 +99,11 @@ decl_error! {
         NotKittyOwner,
         TransferToSelf,
 		MoneyNotEnough,
+
+		RequireOwner,
+		NotForSale,
+		PriceTooLow,
+
 	}
 }
 
@@ -138,6 +154,39 @@ decl_module! {
 			let new_kitty_id = Self::do_breed(&sender, kitty_id_1, kitty_id_2)?;
 			Self::deposit_event(RawEvent::Breed(sender, kitty_id_1, kitty_id_2, new_kitty_id));
 			Ok(())
+		}
+
+		/// Set a price for a kitty for sale
+		/// None to delist the kitty
+		#[weight = 0]
+		pub fn ask(origin, kitty_id: T::KittyIndex, new_price: Option<BalanceOf<T>>) {
+			let sender = ensure_signed(origin)?;
+
+			ensure!(Self::kitties_owner(kitty_id) == Some(sender.clone()), "Kitty is not owned by sender.");
+
+			<KittyPrices<T>>::mutate_exists(kitty_id, |price| *price = new_price);
+
+			Self::deposit_event(RawEvent::Ask(sender, kitty_id, new_price));
+		}
+
+		/// Buy a kitty
+		#[weight = 0]
+		pub fn buy(origin, kitty_id: T::KittyIndex, price: BalanceOf<T>) {
+			let sender = ensure_signed(origin)?;
+
+			let owner = Self::kitties_owner(kitty_id).ok_or(Error::<T>::InvalidKittyId)?;
+
+			let kitty_price = Self::kitty_price(kitty_id).ok_or(Error::<T>::NotForSale)?;
+
+			ensure!(price >= kitty_price, Error::<T>::PriceTooLow);
+
+			T::Currency::transfer(&sender, &owner, kitty_price, ExistenceRequirement::KeepAlive)?;
+
+			<KittyPrices<T>>::remove(kitty_id);
+
+			Self::do_transfer(&owner, &sender, kitty_id);
+
+			Self::deposit_event(RawEvent::Sold(owner, sender, kitty_id, kitty_price));
 		}
 	}
 }
@@ -281,5 +330,23 @@ impl <T: Trait>Module<T> {
 
 
 		Ok(kitty_id)
+	}
+
+	fn do_transfer(from: &T::AccountId, to: &T::AccountId, kitty_id: T::KittyIndex)  {
+		KittyTotal::<T>::mutate(from, |val|{
+			let index = val.iter().position(|id| *id == kitty_id).unwrap();
+			val.remove(index);
+		});
+
+		// Self::insert_owned_kitty(&to, kitty_id);
+		KittyOwners::<T>::insert(kitty_id, &to);
+
+
+		if KittyTotal::<T>::contains_key(&to){
+			KittyTotal::<T>::mutate(to, |val| {val.push(kitty_id)}
+		);
+		}else{
+			KittyTotal::<T>::insert(to, vec![kitty_id]);
+		}
 	}
 }
